@@ -1,0 +1,25 @@
+# Rust build artifacts & machine-local linker config
+/target/
+/.cargo/config.toml
+
+# Android Gradle build outputs, caches, and machine-local SDK/signing secrets
+/android/.gradle/
+/android/local.properties
+/android/build/
+/android/app/build/
+/android/app/src/main/jniLibs/
+/android/app/*.jks
+/android/app/*.keystore
+
+# Packaged installers & distributables (published via GitHub Releases)
+/dist/
+/*.apk
+/*.exe
+/*.msi
+
+# OS & editor clutter
+.DS_Store
+Thumbs.db
+*.iml
+.idea/
+.vscode/

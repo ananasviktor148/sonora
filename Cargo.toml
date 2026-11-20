@@ -1,0 +1,65 @@
+[package]
+name = "hires_player"
+version = "0.1.0"
+edition = "2021"
+description = "Hi-Res Audio Player with DSD support, upsampling, multi-channel, and lyrics"
+
+[lib]
+name = "sonora_core"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "hires_player"
+path = "src/main.rs"
+
+[dependencies]
+# Audio decoding (100% pure Rust)
+symphonia = { version = "0.5", features = ["all"] }
+
+# High-quality resampling (100% pure Rust)
+rubato = "0.16"
+
+# Metadata and lyrics reading (100% pure Rust)
+lofty = "0.22"
+
+# Concurrency
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+anyhow = "1"
+
+# Image handling (album art)
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"] }
+
+# Logging
+log = "0.4"
+
+# Time formatting
+chrono = "0.4"
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+# Desktop GUI
+eframe = { version = "0.31", default-features = true }
+# Desktop audio output
+cpal = { version = "0.15", features = [] }
+# Desktop HTTP client for online lyrics
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+# Desktop file dialogs
+rfd = "0.15"
+# Desktop logging
+env_logger = "0.11"
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+android_logger = "0.14"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
