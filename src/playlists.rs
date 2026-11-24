@@ -324,6 +324,220 @@ pub fn export_m3u8(playlist: &Playlist, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+// ── Fisher-Yates Non-Repeating Shuffle Deck ──────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct ShuffleDeck {
+    playlist_id: String,
+    playlist_len: usize,
+    order: Vec<usize>,
+    cursor: usize,
+    rng_state: u64,
+}
+
+impl Default for ShuffleDeck {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ShuffleDeck {
+    pub fn new() -> Self {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9E37_79B9_7F4A_7C15);
+        Self {
+            playlist_id: String::new(),
+            playlist_len: 0,
+            order: Vec::new(),
+            cursor: 0,
+            rng_state: seed ^ 0xA5A5_5A5A_F0F0_0F0F,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.order.clear();
+        self.playlist_len = 0;
+        self.cursor = 0;
+    }
+
+    pub fn on_tracks_swapped(&mut self, playlist_id: &str, a: usize, b: usize) {
+        if self.playlist_id != playlist_id || a == b {
+            return;
+        }
+        for item in &mut self.order {
+            if *item == a {
+                *item = b;
+            } else if *item == b {
+                *item = a;
+            }
+        }
+    }
+
+    /// SplitMix64 high-quality 64-bit PRNG (passes BigCrush, zero modulo bias on small ranges).
+    fn next_u64(&mut self) -> u64 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u64)
+            .unwrap_or(0);
+        self.rng_state = self
+            .rng_state
+            .wrapping_add(0x9E37_79B9_7F4A_7C15 ^ nanos.rotate_left(17));
+        let mut z = self.rng_state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn random_below(&mut self, bound: usize) -> usize {
+        if bound <= 1 {
+            return 0;
+        }
+        (self.next_u64() % (bound as u64)) as usize
+    }
+
+    fn build_cycle(&mut self, playlist_id: &str, len: usize, anchor_first: Option<usize>, avoid_first: Option<usize>) {
+        self.playlist_id = playlist_id.to_string();
+        self.playlist_len = len;
+        self.order = (0..len).collect();
+        self.cursor = 0;
+
+        if len <= 1 {
+            return;
+        }
+
+        // Unbiased Fisher-Yates shuffle
+        for i in (1..len).rev() {
+            let j = self.random_below(i + 1);
+            self.order.swap(i, j);
+        }
+
+        if let Some(first) = anchor_first.filter(|&idx| idx < len) {
+            if let Some(pos) = self.order.iter().position(|&x| x == first) {
+                self.order.swap(0, pos);
+            }
+            // Re-randomize tail 1..len so the remaining N-1 tracks are uniformly permuted
+            for i in (2..len).rev() {
+                let j = 1 + self.random_below(i);
+                self.order.swap(i, j);
+            }
+        } else if let Some(avoid) = avoid_first.filter(|&idx| idx < len) {
+            if self.order[0] == avoid {
+                let swap_with = 1 + self.random_below(len - 1);
+                self.order.swap(0, swap_with);
+            }
+        }
+    }
+
+    /// Synchronize deck when a track is loaded. If `idx` matches the current shuffle cursor,
+    /// preserves the cycle; if the user manually picked a new track, starts a fresh cycle from `idx`.
+    pub fn on_track_loaded(&mut self, playlist_id: &str, len: usize, idx: usize) {
+        if len == 0 || idx >= len {
+            self.reset();
+            return;
+        }
+        if self.playlist_id == playlist_id
+            && self.playlist_len == len
+            && self.order.len() == len
+            && self.order.get(self.cursor) == Some(&idx)
+        {
+            return;
+        }
+        self.build_cycle(playlist_id, len, Some(idx), None);
+    }
+
+    /// Return the next track index in the non-repeating shuffle bag.
+    /// Every track in the playlist is visited once before any track repeats.
+    pub fn next_index(
+        &mut self,
+        playlist_id: &str,
+        len: usize,
+        current_index: Option<usize>,
+        allow_wrap: bool,
+    ) -> Option<usize> {
+        if len == 0 {
+            return None;
+        }
+        if len == 1 {
+            return if allow_wrap || current_index.is_none() {
+                Some(0)
+            } else {
+                None
+            };
+        }
+
+        let valid_deck = self.playlist_id == playlist_id
+            && self.playlist_len == len
+            && self.order.len() == len;
+
+        if !valid_deck {
+            if let Some(cur) = current_index.filter(|&i| i < len) {
+                self.build_cycle(playlist_id, len, Some(cur), None);
+                self.cursor = 1;
+                return Some(self.order[1]);
+            } else {
+                self.build_cycle(playlist_id, len, None, None);
+                self.cursor = 0;
+                return Some(self.order[0]);
+            }
+        }
+
+        // If current_index drifted from cursor, resync to its position in the current bag
+        if let Some(cur) = current_index.filter(|&i| i < len) {
+            if self.order.get(self.cursor) != Some(&cur) {
+                if let Some(pos) = self.order.iter().position(|&x| x == cur) {
+                    self.cursor = pos;
+                }
+            }
+        }
+
+        if self.cursor + 1 < len {
+            self.cursor += 1;
+            Some(self.order[self.cursor])
+        } else if allow_wrap {
+            let last_played = self.order.last().copied().or(current_index);
+            self.build_cycle(playlist_id, len, None, last_played);
+            self.cursor = 0;
+            Some(self.order[0])
+        } else {
+            None
+        }
+    }
+
+    /// Step backward through the shuffled play order.
+    pub fn prev_index(
+        &mut self,
+        playlist_id: &str,
+        len: usize,
+        current_index: Option<usize>,
+    ) -> Option<usize> {
+        if len == 0 {
+            return None;
+        }
+        if len == 1 {
+            return Some(0);
+        }
+
+        let valid_deck = self.playlist_id == playlist_id
+            && self.playlist_len == len
+            && self.order.len() == len;
+
+        if !valid_deck {
+            self.build_cycle(playlist_id, len, current_index, None);
+            self.cursor = len - 1;
+            return Some(self.order[self.cursor]);
+        }
+
+        if self.cursor > 0 {
+            self.cursor -= 1;
+        } else {
+            self.cursor = len - 1;
+        }
+        Some(self.order[self.cursor])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,5 +610,52 @@ mod tests {
 
         let _ = fs::remove_file(&m3u_path);
         let _ = fs::remove_file(&dummy_wav);
+    }
+
+    #[test]
+    fn shuffle_deck_plays_every_track_once_per_cycle_without_repeats() {
+        let mut deck = ShuffleDeck::new();
+        let pid = "pl-test";
+        let len = 8usize;
+
+        // Start playing track 3
+        deck.on_track_loaded(pid, len, 3);
+        let mut seen = vec![3usize];
+        for _ in 1..len {
+            let next = deck
+                .next_index(pid, len, seen.last().copied(), false)
+                .expect("should yield remaining tracks in cycle");
+            assert!(
+                !seen.contains(&next),
+                "track {} repeated before cycle finished (seen={:?})",
+                next,
+                seen
+            );
+            seen.push(next);
+        }
+        assert_eq!(seen.len(), len);
+
+        // With allow_wrap = false, cycle end returns None
+        assert_eq!(deck.next_index(pid, len, seen.last().copied(), false), None);
+
+        // With allow_wrap = true, starts a new cycle and never repeats the last track back-to-back
+        let last_of_cycle1 = *seen.last().unwrap();
+        let first_of_cycle2 = deck
+            .next_index(pid, len, Some(last_of_cycle1), true)
+            .expect("should wrap into new shuffle cycle");
+        assert_ne!(
+            first_of_cycle2, last_of_cycle1,
+            "must not repeat last track of cycle 1 at start of cycle 2"
+        );
+
+        let mut cycle2 = vec![first_of_cycle2];
+        for _ in 1..len {
+            let next = deck
+                .next_index(pid, len, cycle2.last().copied(), false)
+                .unwrap();
+            assert!(!cycle2.contains(&next));
+            cycle2.push(next);
+        }
+        assert_eq!(cycle2.len(), len);
     }
 }

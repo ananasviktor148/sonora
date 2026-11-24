@@ -30,7 +30,7 @@ use crate::audio::{
 use crate::config::{AppConfig, AutoVolumeMode, DsdOutputMode, RepeatMode};
 use crate::lyrics::{self, LyricsDocument};
 use crate::playlists::{
-    is_playlist_file, parse_m3u_file, Playlist, PlaylistEntry, PlaylistLibrary,
+    is_playlist_file, parse_m3u_file, Playlist, PlaylistEntry, PlaylistLibrary, ShuffleDeck,
 };
 
 pub const VISUALIZER_FLOAT_LEN: usize = SPECTRUM_BANDS * 2 + MAX_METER_CHANNELS * 3; // 48 + 48 + 8 + 8 + 8 = 120
@@ -121,6 +121,7 @@ pub struct SonoraMobileEngine {
     pub library: PlaylistLibrary,
     pub playing_playlist_id: Option<String>,
     pub current_index: Option<usize>,
+    shuffle_deck: ShuffleDeck,
 
     decoder: Option<Box<dyn StreamingDecoder>>,
     props: Option<StreamProperties>,
@@ -191,6 +192,7 @@ impl SonoraMobileEngine {
             library,
             playing_playlist_id: None,
             current_index: None,
+            shuffle_deck: ShuffleDeck::new(),
             decoder: None,
             props: None,
             track_info: None,
@@ -476,17 +478,19 @@ impl SonoraMobileEngine {
     }
 
     pub fn load_track(&mut self, playlist_id: &str, index: usize, autoplay: bool) {
-        let Some(entry) = self
-            .library
-            .get(playlist_id)
-            .and_then(|pl| pl.tracks.get(index))
-            .cloned()
-        else {
+        let Some((entry, pl_len)) = self.library.get(playlist_id).and_then(|pl| {
+            pl.tracks
+                .get(index)
+                .cloned()
+                .map(|e| (e, pl.tracks.len()))
+        }) else {
             return;
         };
 
         self.playing_playlist_id = Some(playlist_id.to_string());
         self.current_index = Some(index);
+        self.shuffle_deck
+            .on_track_loaded(playlist_id, pl_len, index);
         self.mute_solo = ChannelMuteSolo::default();
         self.lyrics_offset_ms = 0;
         self.error_message = None;
@@ -673,15 +677,15 @@ impl SonoraMobileEngine {
             }
         }
         if self.config.shuffle && len > 1 {
-            let now_nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos() as usize)
-                .unwrap_or(1);
-            let mut next = now_nanos % len;
-            if Some(next) == self.current_index {
-                next = (next + 1) % len;
+            let allow_wrap = user_triggered || self.config.repeat_mode == RepeatMode::All;
+            if let Some(next) =
+                self.shuffle_deck
+                    .next_index(&pid, len, self.current_index, allow_wrap)
+            {
+                self.load_track(&pid, next, true);
+            } else {
+                self.state = PlaybackState::Stopped;
             }
-            self.load_track(&pid, next, true);
             return;
         }
         match self.current_index {
@@ -707,6 +711,12 @@ impl SonoraMobileEngine {
             self.seek(0.0);
             return;
         }
+        if self.config.shuffle && len > 1 {
+            if let Some(prev) = self.shuffle_deck.prev_index(&pid, len, self.current_index) {
+                self.load_track(&pid, prev, true);
+                return;
+            }
+        }
         let prev = match self.current_index {
             Some(idx) if idx > 0 => idx - 1,
             _ => len - 1,
@@ -726,6 +736,14 @@ impl SonoraMobileEngine {
 
     pub fn toggle_shuffle(&mut self) {
         self.config.shuffle = !self.config.shuffle;
+        self.shuffle_deck.reset();
+        if self.config.shuffle {
+            let pid = self.playback_playlist_id();
+            let len = self.library.get(&pid).map(|p| p.tracks.len()).unwrap_or(0);
+            if let Some(cur) = self.current_index {
+                self.shuffle_deck.on_track_loaded(&pid, len, cur);
+            }
+        }
         self.config.save();
     }
 
@@ -748,9 +766,21 @@ impl SonoraMobileEngine {
             || self.config.filter_rolloff != new_cfg.filter_rolloff;
         let av_changed = self.config.auto_volume != new_cfg.auto_volume
             || self.config.dsd.gain_boost_6db != new_cfg.dsd.gain_boost_6db;
+        let shuffle_changed = self.config.shuffle != new_cfg.shuffle;
 
         self.config = new_cfg;
         self.config.save();
+
+        if shuffle_changed {
+            self.shuffle_deck.reset();
+            if self.config.shuffle {
+                let pid = self.playback_playlist_id();
+                let len = self.library.get(&pid).map(|p| p.tracks.len()).unwrap_or(0);
+                if let Some(cur) = self.current_index {
+                    self.shuffle_deck.on_track_loaded(&pid, len, cur);
+                }
+            }
+        }
 
         if dsd_changed {
             // Reopen decoder at current position so new DSD decimator LPF / rate / +6dB engages seamlessly
@@ -1155,6 +1185,7 @@ impl SonoraMobileEngine {
         if let Some(pl) = self.library.active_mut() {
             if from < pl.tracks.len() && to < pl.tracks.len() && from != to {
                 pl.tracks.swap(from, to);
+                self.shuffle_deck.on_tracks_swapped(&active_id, from, to);
                 if is_playing_pl {
                     if self.current_index == Some(from) {
                         self.current_index = Some(to);

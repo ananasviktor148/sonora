@@ -22,7 +22,7 @@ use crate::config::{
 };
 use crate::lyrics::{self, is_lyrics_file, LyricsDocument, SUPPORTED_LYRICS_EXTENSIONS};
 use crate::playlists::{
-    export_m3u8, is_playlist_file, parse_m3u_file, PlaylistEntry, PlaylistLibrary,
+    export_m3u8, is_playlist_file, parse_m3u_file, PlaylistEntry, PlaylistLibrary, ShuffleDeck,
 };
 
 // ── Swiss Grid · High-Contrast Dark Editorial · Tactile Minimal Palette ──────
@@ -88,6 +88,7 @@ pub struct AudioPlayerApp {
     library: PlaylistLibrary,
     playing_playlist_id: Option<String>,
     current_index: Option<usize>,
+    shuffle_deck: ShuffleDeck,
     playlist_editor: Option<PlaylistEditorMode>,
     playlist_editor_focus: bool,
     playlist_name_buf: String,
@@ -147,6 +148,7 @@ impl AudioPlayerApp {
             library,
             playing_playlist_id: None,
             current_index: None,
+            shuffle_deck: ShuffleDeck::new(),
             playlist_editor: None,
             playlist_editor_focus: false,
             playlist_name_buf: String::new(),
@@ -462,18 +464,20 @@ impl AudioPlayerApp {
     }
 
     fn load_from_playlist(&mut self, playlist_id: &str, index: usize, autoplay: bool) {
-        let entry = match self
-            .library
-            .get(playlist_id)
-            .and_then(|pl| pl.tracks.get(index))
-            .cloned()
-        {
-            Some(e) => e,
+        let (entry, pl_len) = match self.library.get(playlist_id).and_then(|pl| {
+            pl.tracks
+                .get(index)
+                .cloned()
+                .map(|e| (e, pl.tracks.len()))
+        }) {
+            Some(pair) => pair,
             None => return,
         };
 
         self.playing_playlist_id = Some(playlist_id.to_string());
         self.current_index = Some(index);
+        self.shuffle_deck
+            .on_track_loaded(playlist_id, pl_len, index);
         self.album_art_texture = None;
         self.album_art_path = None;
         self.editing_lyrics = false;
@@ -674,15 +678,13 @@ impl AudioPlayerApp {
         }
 
         if self.config.shuffle && len > 1 {
-            let now_nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos() as usize)
-                .unwrap_or(1);
-            let mut next = now_nanos % len;
-            if Some(next) == self.current_index {
-                next = (next + 1) % len;
+            let allow_wrap = user_triggered || self.config.repeat_mode == RepeatMode::All;
+            if let Some(next) =
+                self.shuffle_deck
+                    .next_index(&pid, len, self.current_index, allow_wrap)
+            {
+                self.load_from_playlist(&pid, next, true);
             }
-            self.load_from_playlist(&pid, next, true);
             return;
         }
 
@@ -706,6 +708,12 @@ impl AudioPlayerApp {
         if self.status.position > 3.0 && self.status.state == PlaybackState::Playing {
             self.engine.send(AudioCommand::Seek(0.0));
             return;
+        }
+        if self.config.shuffle && len > 1 {
+            if let Some(prev) = self.shuffle_deck.prev_index(&pid, len, self.current_index) {
+                self.load_from_playlist(&pid, prev, true);
+                return;
+            }
         }
         let prev = match self.current_index {
             Some(idx) if idx > 0 => idx - 1,
@@ -2358,6 +2366,7 @@ impl AudioPlayerApp {
                     if let Some(pl) = self.library.active_mut() {
                         if idx > 0 && idx < pl.tracks.len() {
                             pl.tracks.swap(idx, idx - 1);
+                            self.shuffle_deck.on_tracks_swapped(&active_id, idx, idx - 1);
                             if is_viewing_playing_pl {
                                 if self.current_index == Some(idx) {
                                     self.current_index = Some(idx - 1);
@@ -2373,6 +2382,7 @@ impl AudioPlayerApp {
                     if let Some(pl) = self.library.active_mut() {
                         if idx + 1 < pl.tracks.len() {
                             pl.tracks.swap(idx, idx + 1);
+                            self.shuffle_deck.on_tracks_swapped(&active_id, idx, idx + 1);
                             if is_viewing_playing_pl {
                                 if self.current_index == Some(idx) {
                                     self.current_index = Some(idx + 1);
@@ -4414,6 +4424,14 @@ impl AudioPlayerApp {
                     .clicked()
                     {
                         self.config.shuffle = !self.config.shuffle;
+                        self.shuffle_deck.reset();
+                        if self.config.shuffle {
+                            let pid = self.playback_playlist_id();
+                            let len = self.library.get(&pid).map(|p| p.tracks.len()).unwrap_or(0);
+                            if let Some(cur) = self.current_index {
+                                self.shuffle_deck.on_track_loaded(&pid, len, cur);
+                            }
+                        }
                         self.config.save();
                     }
 
